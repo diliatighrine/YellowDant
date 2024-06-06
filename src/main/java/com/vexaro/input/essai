@@ -1,0 +1,853 @@
+package com.vexaro.in.memory.db.controller;
+
+import org.springframework.context.annotation.Bean;
+import org.springframework.context.annotation.Configuration;
+import org.springframework.web.client.RestTemplate;
+
+@Configuration
+public class RestTemplateConfig {
+
+    @Bean
+    public RestTemplate restTemplate() {
+        // Instancier RestTemplate sans spécifier de factory
+        return new RestTemplate();
+    }
+}
+
+package com.vexaro.in.memory.db.controller;
+
+import com.vexaro.in.memory.db.dto.PaginatedTableData;
+import com.vexaro.in.memory.db.dto.TableRowsRequest;
+import com.vexaro.in.memory.db.models.TableDefinition;
+import com.vexaro.in.memory.db.services.DynamicChangesHandler;
+import com.vexaro.in.memory.db.services.LoadBalancer;
+import com.vexaro.in.memory.db.services.NodeDiscovery;
+import com.vexaro.in.memory.db.services.ParquetDataService;
+import com.vexaro.in.memory.db.services.Partitioner;
+import com.vexaro.in.memory.db.services.TableService;
+import lombok.RequiredArgsConstructor;
+import lombok.extern.slf4j.Slf4j;
+
+import com.fasterxml.jackson.core.type.TypeReference;
+import com.fasterxml.jackson.databind.ObjectMapper;
+import com.fasterxml.jackson.databind.JsonNode;
+
+import org.eclipse.jetty.util.Callback.Completable;
+import org.springframework.http.HttpStatus;
+import org.springframework.http.ResponseEntity;
+import org.springframework.web.bind.annotation.*;
+import org.springframework.web.multipart.MultipartFile;
+import org.springframework.web.bind.annotation.*;
+import org.springframework.http.HttpEntity;
+import org.springframework.http.HttpHeaders;
+import org.springframework.http.HttpMethod;
+import org.springframework.http.MediaType;
+import org.springframework.web.client.RestTemplate;
+import org.springframework.beans.factory.annotation.Autowired;
+import org.springframework.core.ParameterizedTypeReference;
+import org.springframework.http.*;
+
+import java.io.File;
+import java.io.IOException;
+import java.net.URI;
+import java.net.http.HttpClient;
+import java.net.http.HttpRequest;
+import java.net.http.HttpResponse;
+import java.util.ArrayList;
+import java.util.Collections;
+import java.util.HashMap;
+import java.util.List;
+import java.util.Map;
+import java.util.concurrent.CompletableFuture;
+import org.springframework.web.bind.annotation.PostMapping;
+import org.springframework.web.bind.annotation.RequestBody;
+import org.springframework.web.client.RestTemplate;
+
+@Slf4j
+@RestController
+@RequestMapping("/api/tables")
+@RequiredArgsConstructor
+public class TableController {
+
+    private final TableService tableService;
+    private final ParquetDataService parquetDataService;
+    private final NodeDiscovery nodeDiscovery;
+    private final Partitioner partitioner;
+    private final LoadBalancer loadBalancer;
+    private final DynamicChangesHandler dynamicChangesHandler;
+
+    @Autowired
+    private RestTemplate restTemplate;
+
+    @PostMapping("/create")
+    ResponseEntity<String> createTableSchema(@RequestBody TableDefinition tableDefinition) {
+        tableService.createSchema(tableDefinition);
+        return ResponseEntity.ok("Table created Successfully");
+    }
+
+    @PostMapping("/load/{tableName}")
+    ResponseEntity<String> loadTableData(@PathVariable String tableName, @RequestBody TableRowsRequest data) {
+        String responsibleNode = partitioner.getNodeForKey(tableName);
+
+        // Préparer l'URL du nœud responsable
+        String url = "http://" + responsibleNode + "/api/tables/load/" + tableName;
+
+        // Préparer les en-têtes et le corps de la requête
+        HttpHeaders headers = new HttpHeaders();
+        headers.setContentType(MediaType.APPLICATION_JSON);
+        HttpEntity<TableRowsRequest> requestEntity = new HttpEntity<>(data, headers);
+
+        // Envoyer la requête au nœud responsable
+        RestTemplate restTemplate = new RestTemplate();
+        ResponseEntity<String> responseEntity = restTemplate.exchange(url, HttpMethod.POST, requestEntity,
+                String.class);
+
+        // Vérifier la réponse
+        if (responseEntity.getStatusCode() == HttpStatus.OK) {
+            return ResponseEntity.ok("Data loaded Successfully");
+        } else {
+            return ResponseEntity.status(HttpStatus.INTERNAL_SERVER_ERROR)
+                    .body("Failed to load data in '" + tableName + "' schema on node: " + responsibleNode);
+        }
+    }
+
+    @GetMapping("/retrieve/{tableName}")
+    ResponseEntity<List<List<String>>> retrieveTableData(@PathVariable String tableName) {
+        List<String> activeNodes = nodeDiscovery.discoverActiveNodes();
+        if (activeNodes.isEmpty()) {
+            // Aucun nœud disponible
+            return ResponseEntity.status(HttpStatus.SERVICE_UNAVAILABLE).build();
+        }
+
+        // Utiliser LoadBalancer pour équilibrer la charge entre les nœuds disponibles
+        String selectedNode = loadBalancer.selectNode(activeNodes);
+
+        // Envoyer une requête pour récupérer les données au nœud sélectionné
+        ResponseEntity<List<List<String>>> response = sendRetrieveRequest(selectedNode, tableName);
+        if (response.getStatusCode().is2xxSuccessful()) {
+            return ResponseEntity.ok(response.getBody());
+        } else {
+            // Gérer les erreurs de récupération des données depuis le nœud sélectionné
+            return ResponseEntity.status(response.getStatusCode()).build();
+        }
+    }
+
+    private ResponseEntity<List<List<String>>> sendRetrieveRequest(String node, String tableName) {
+        String url = "http://" + node + "/api/tables/" + tableName;
+        HttpHeaders headers = new HttpHeaders();
+        headers.setContentType(MediaType.APPLICATION_JSON);
+        HttpEntity<String> entity = new HttpEntity<>(headers);
+
+        return restTemplate.exchange(url, HttpMethod.GET, entity, new ParameterizedTypeReference<List<List<String>>>() {
+        });
+    }
+
+    @GetMapping("/{tableName}")
+    ResponseEntity<PaginatedTableData> getTableData(
+            @PathVariable String tableName,
+            @RequestParam(required = false, defaultValue = "0") int page,
+            @RequestParam(required = false, defaultValue = "10") int size) {
+
+        int offset = page * size;
+        PaginatedTableData paginatedTableData = tableService.retrieveTableDataWithPagination(tableName, offset, size);
+        if (paginatedTableData.getRows() != null) {
+            return ResponseEntity.ok(paginatedTableData);
+        } else {
+            return ResponseEntity.notFound().build();
+        }
+    }
+
+    @PostMapping("/loadParquet/{tableName}")
+    public ResponseEntity<String> loadParquetData(@PathVariable String tableName,
+            @RequestParam("file") MultipartFile file) {
+        if (file.isEmpty()) {
+            return ResponseEntity.status(HttpStatus.BAD_REQUEST).body("File is empty");
+        }
+
+        // Write the file to a local temp file
+        File tempFile;
+        try {
+            tempFile = File.createTempFile("parquet-upload-", ".parquet");
+            file.transferTo(tempFile);
+        } catch (IOException e) {
+            return ResponseEntity.status(HttpStatus.INTERNAL_SERVER_ERROR).body("Error writing uploaded file to disk");
+        }
+
+        try {
+            // Process the file after it's been written to disk
+            parquetDataService.parseParquetFile(tempFile.getAbsolutePath(), rows -> {
+                // charger les données de maniere asynchrone
+                CompletableFuture.runAsync(() -> tableService.loadTableData(tableName, rows));
+            });
+
+            return ResponseEntity.ok("Data loaded successfully into table: " + tableName);
+        } catch (Exception e) {
+            return ResponseEntity.status(HttpStatus.INTERNAL_SERVER_ERROR)
+                    .body("Error loading Parquet data: " + e.getMessage());
+        } finally {
+            // Make sure to clean up the temp file
+            if (tempFile != null && tempFile.exists()) {
+                tempFile.delete();
+            }
+        }
+    }
+
+    @GetMapping("/{tableName}/aggregate")
+    public ResponseEntity<Map<String, Object>> performAggregate(
+            @PathVariable String tableName,
+            @RequestParam String function,
+            @RequestParam String column) {
+        List<String> activeNodes = nodeDiscovery.discoverActiveNodes();
+        if (activeNodes.isEmpty()) {
+            // Aucun nœud disponible
+            return ResponseEntity.status(HttpStatus.SERVICE_UNAVAILABLE).build();
+        }
+
+        // Utiliser LoadBalancer pour équilibrer la charge entre les nœuds disponibles
+        List<String> nodesWithTable = nodeDiscovery.getNodesWithTable(tableName);
+        if (nodesWithTable.isEmpty()) {
+            // Aucun nœud avec la table spécifiée
+            return ResponseEntity.status(HttpStatus.NOT_FOUND)
+                    .body(Collections.singletonMap("error", "Table '" + tableName + "' not found on any node"));
+        }
+
+        String selectedNode = loadBalancer.selectNode(nodesWithTable);
+
+        // Envoyer une requête pour effectuer l'agrégation sur le nœud sélectionné
+        ResponseEntity<Map<String, Object>> response = sendAggregateRequest(selectedNode, tableName, function, column);
+        if (response.getStatusCode().is2xxSuccessful()) {
+            return ResponseEntity.ok(response.getBody());
+        } else {
+            // Gérer les erreurs de récupération des données depuis le nœud sélectionné
+            return ResponseEntity.status(response.getStatusCode())
+                    .body(Collections.singletonMap("error", "Failed to perform aggregation on node: " + selectedNode));
+        }
+    }
+
+    private ResponseEntity<Map<String, Object>> sendAggregateRequest(String node, String tableName, String function,
+            String column) {
+        String url = "http://" + node + "/api/tables/" + tableName + "/aggregate?function=" + function + "&column="
+                + column;
+        HttpHeaders headers = new HttpHeaders();
+        headers.setContentType(MediaType.APPLICATION_JSON);
+        HttpEntity<String> entity = new HttpEntity<>(headers);
+
+        return restTemplate.exchange(url, HttpMethod.GET, entity,
+                new ParameterizedTypeReference<Map<String, Object>>() {
+                });
+    }
+
+    // Endpoint pour la communication entre les nœuds
+    @PostMapping("/communication")
+    public ResponseEntity<String> nodeCommunication(@RequestBody String message) {
+        log.info("Received message from another node: {}", message);
+        // Analyser le message et effectuer les actions nécessaires (insertion, mise à
+        // jour, suppression)
+        try {
+            ObjectMapper objectMapper = new ObjectMapper();
+            JsonNode jsonNode = objectMapper.readTree(message);
+            String operationType = jsonNode.get("operation_type").asText();
+            String tableName = jsonNode.get("table_name").asText();
+            JsonNode dataNode = jsonNode.get("data");
+            switch (operationType) {
+                case "insert":
+                    List<String> insertData = parseDataNode(dataNode);
+                    tableService.insertData(tableName, insertData);
+                    break;
+                case "update":
+                    int rowIndex = jsonNode.get("row_index").asInt();
+                    List<String> updatedData = parseDataNode(dataNode);
+                    tableService.updateData(tableName, rowIndex, updatedData);
+                    break;
+                case "delete":
+                    int deleteIndex = jsonNode.get("row_index").asInt();
+                    tableService.deleteData(tableName, deleteIndex);
+                    break;
+                default:
+                    log.error("Unsupported operation type: {}", operationType);
+                    return ResponseEntity.badRequest().body("Unsupported operation type: " + operationType);
+            }
+            return ResponseEntity.ok("Message received and processed successfully");
+        } catch (IOException e) {
+            log.error("Error while processing received message: {}", e.getMessage());
+            return ResponseEntity.status(HttpStatus.INTERNAL_SERVER_ERROR).body("Error processing message");
+        }
+    }
+
+    // Méthode pour synchroniser les données avec d'autres nœuds private void
+    // synchronizeData(String tableName, JsonNode data, String operationType) {
+    // log.info("Synchronizing data for table '{}'", tableName); List<String>
+    // nodeAddresses = nodeDiscovery.discoverActiveNodes(); for (String nodeAddress
+    // : nodeAddresses) { try { HttpClient client = HttpClient.newHttpClient();
+    // ObjectMapper objectMapper = new ObjectMapper(); ObjectNode message =
+    // objectMapper.createObjectNode(); message.put("operation_type",
+    // operationType); message.put("table_name", tableName); message.set("data",
+    // data); HttpRequest request = HttpRequest.newBuilder()
+    // .uri(URI.create("http://" + nodeAddress + "/api/tables/communication"))
+    // .header("Content-Type", "application/json")
+    // .POST(HttpRequest.BodyPublishers.ofString(objectMapper.writeValueAsString(message)))
+    // .build(); HttpResponse<String> response = client.send(request,
+    // HttpResponse.BodyHandlers.ofString()); if (response.statusCode() == 200) {
+    // log.info("Data synchronized successfully with node: {}", nodeAddress); } else
+    // { log.error("Failed to synchronize data with node: {}", nodeAddress); } }
+    // catch (IOException | InterruptedException e) { log.error("Error while
+    // synchronizing data with node: {}", nodeAddress); e.printStackTrace(); } } }
+    // // Méthode pour envoyer une demande de synchronisation à un nœud spécifique
+    // private void sendSynchronizationRequest(String nodeAddress, String tableName,
+    // JsonNode data, String operationType) { try { HttpClient client =
+    // HttpClient.newHttpClient(); ObjectMapper objectMapper = new ObjectMapper();
+    // ObjectNode message = objectMapper.createObjectNode();
+    // message.put("operation_type", operationType); message.put("table_name",
+    // tableName); message.set("data", data); HttpRequest request =
+    // HttpRequest.newBuilder() .uri(URI.create("http://" + nodeAddress +
+    // "/api/tables/communication")) .header("Content-Type", "application/json")
+    // .POST(HttpRequest.BodyPublishers.ofString(objectMapper.writeValueAsString(message)))
+    // .build(); HttpResponse<String> response = client.send(request,
+    // HttpResponse.BodyHandlers.ofString()); if (response.statusCode() == 200) {
+    // log.info("Synchronization request sent to node '{}' for table '{}'",
+    // nodeAddress, tableName); } else { log.error("Failed to send synchronization
+    // request to node: {}", nodeAddress); } } catch (IOException |
+    // InterruptedException e) { log.error("Error while sending synchronization
+    // request to node: {}", nodeAddress); e.printStackTrace(); } }
+
+    @PostMapping("/synchronize")
+    public ResponseEntity<String> synchronizeDataFromNode(@RequestBody String synchronizationData) {
+        try {
+            // Convertir les données de synchronisation JSON en une structure de données
+            // utilisable
+            ObjectMapper objectMapper = new ObjectMapper();
+            List<List<String>> data = objectMapper.readValue(synchronizationData,
+                    new TypeReference<List<List<String>>>() {
+                    });
+
+            // Traiter les données de synchronisation et mettre à jour la base de données
+            // locale
+            for (List<String> row : data) {
+                String tableName = row.get(0);
+                row.remove(0); // Supprimer le nom de la table de la première colonne
+                tableService.loadTableData(tableName, Collections.singletonList(row));
+            }
+
+            // Répondre avec un message de confirmation ou d'état
+            return ResponseEntity.ok("Synchronization data received and processed successfully");
+        } catch (IOException e) {
+            // Gérer les erreurs de désérialisation des données de synchronisation JSON
+            log.error("Error processing synchronization data: {}", e.getMessage());
+            return ResponseEntity.status(HttpStatus.INTERNAL_SERVER_ERROR)
+                    .body("Error processing synchronization data");
+        }
+    }
+
+    // select all
+    @GetMapping("/retrieveAll/{tableName}")
+    ResponseEntity<List<List<String>>> retrieveAllTableData(@PathVariable String tableName) {
+        TableDefinition tableDefinition = tableService.retrieveTableData(tableName);
+        if (tableDefinition != null && tableDefinition.getRows() != null) {
+            return ResponseEntity.ok(tableDefinition.getRows());
+        } else {
+            return ResponseEntity.notFound().build();
+        }
+    }
+
+    // select where
+    @GetMapping("/retrieveByCondition/{tableName}")
+    ResponseEntity<List<List<String>>> retrieveTableDataByCondition(
+            @PathVariable String tableName,
+            @RequestParam String column,
+            @RequestParam String value) {
+        TableDefinition tableDefinition = tableService.retrieveTableData(tableName);
+        if (tableDefinition != null && tableDefinition.getRows() != null) {
+            List<List<String>> filteredRows = new ArrayList<>();
+            for (List<String> row : tableDefinition.getRows()) {
+                // Vérifie si la valeur de la colonne spécifiée correspond à la valeur
+                // recherchée
+                int columnIndex = tableDefinition.getColumnIndex(column);
+                if (columnIndex != -1 && row.size() > columnIndex && row.get(columnIndex).equals(value)) {
+                    filteredRows.add(row);
+                }
+            }
+            return ResponseEntity.ok(filteredRows);
+        } else {
+            return ResponseEntity.notFound().build();
+        }
+    }
+
+    // select group by
+    @GetMapping("/groupBy/{tableName}")
+    public ResponseEntity<Map<String, Object>> groupBy(
+            @PathVariable String tableName,
+            @RequestParam String groupByColumn,
+            @RequestParam String aggregateFunction,
+            @RequestParam String aggregateColumn) {
+        try {
+            // Effectuer l'agrégation des données en fonction de la colonne spécifiée
+            double result = tableService.aggregate(tableName, aggregateFunction, aggregateColumn);
+
+            // Préparer la réponse
+            Map<String, Object> response = new HashMap<>();
+            response.put("groupedBy", groupByColumn);
+            response.put("aggregateFunction", aggregateFunction);
+            response.put("aggregateColumn", aggregateColumn);
+            response.put("result", result);
+
+            return ResponseEntity.ok(response);
+        } catch (IllegalArgumentException e) {
+            // Gérer les cas où la table spécifiée n'existe pas ou les colonnes sont
+            // invalides
+            return ResponseEntity.badRequest().body(Collections.singletonMap("error", e.getMessage()));
+        }
+    }
+
+    private List<String> parseDataNode(JsonNode dataNode) {
+        List<String> rowData = new ArrayList<>();
+        dataNode.forEach(node -> rowData.add(node.asText()));
+        return rowData;
+    }
+
+}
+package com.vexaro.in.memory.db.dto;
+
+import lombok.Data;
+
+import java.util.List;
+import java.util.Map;
+
+@Data
+public class PaginatedTableData {
+    private List<Map<String, String>> rows;
+    private int totalPages;
+    private long totalEntries;
+}
+package com.vexaro.in.memory.db.models;
+
+import lombok.Data;
+
+@Data
+public class Column {
+    private String name;
+    private String type;
+}
+package com.vexaro.in.memory.db.models;
+
+
+public class Partition {
+    private String node; // Le nœud responsable de cette partition
+
+    // Constructeur
+    public Partition(String node) {
+        this.node = node;
+    }
+
+    // Getter et setter pour le nœud responsable
+    public String getNode() {
+        return node;
+    }
+
+    public void setNode(String node) {
+        this.node = node;
+    }
+}
+package com.vexaro.in.memory.db.models;
+
+import lombok.Data;
+
+import java.util.List;
+
+@Data
+public class TableDefinition {
+    private String name;
+    private List<Column> columns;
+    private List<List<String>> rows;
+
+    public int getColumnIndex(String columnName) {
+        for (int i = 0; i < columns.size(); i++) {
+            if (columns.get(i).getName().equalsIgnoreCase(columnName)) {
+                return i;
+            }
+        }
+        return -1; // Column not found
+    }
+}
+package com.vexaro.in.memory.db.services;
+import java.util.List;
+import java.util.Random;
+import org.springframework.stereotype.Component;
+import com.vexaro.in.memory.db.models.Partition;
+
+@Component
+public class LoadBalancer {
+
+    public String selectNode(List<String> nodes) {
+        Random random = new Random();
+        int index = random.nextInt(nodes.size());
+        return nodes.get(index);
+    }
+    public void balanceLoad(List<String> nodes, List<Partition> partitions) {
+        int totalNodes = nodes.size();
+        int totalPartitions = partitions.size();
+       
+        if (totalNodes == 0 || totalPartitions == 0) {
+            return; // Rien à équilibrer
+        }
+       
+        int partitionsPerNode = totalPartitions / totalNodes;
+        int remainingPartitions = totalPartitions % totalNodes;
+        int assignedPartitions = 0;
+       
+        for (int i = 0; i < totalNodes; i++) {
+            int partitionsForThisNode = partitionsPerNode;
+            if (i < remainingPartitions) {
+                partitionsForThisNode++;
+            }
+            for (int j = 0; j < partitionsForThisNode; j++) {
+                partitions.get(assignedPartitions++).setNode(nodes.get(i));
+            }
+        }
+    }
+}
+package com.vexaro.in.memory.db.services;
+
+import java.io.IOException;
+import java.net.InetAddress;
+import java.util.ArrayList;
+import java.util.HashMap;
+import java.util.List;
+import java.util.Map;
+
+import org.springframework.stereotype.Component;
+
+@Component
+public class NodeDiscovery {
+
+   private Map<String, List<String>> tableNodeMap; // Mapping des tables à leurs nœuds
+
+   public NodeDiscovery() {
+       tableNodeMap = new HashMap<>();
+   }
+
+   public List<String> discoverActiveNodes() {
+       List<String> activeNodes = new ArrayList<>();
+       int timeout = 1000; // Timeout en millisecondes
+
+       // Définir une plage d'adresses IP à vérifier
+       String baseIpAddress = "192.168.1.";
+       int startRange = 1;
+       int endRange = 10;
+
+       for (int i = startRange; i <= endRange; i++) {
+           String ipAddress = baseIpAddress + i;
+           try {
+               InetAddress inet = InetAddress.getByName(ipAddress);
+               if (inet.isReachable(timeout)) {
+                   activeNodes.add(ipAddress);
+               }
+           } catch (IOException e) {
+               // Gérer les exceptions
+           }
+       }
+
+       return activeNodes;
+   }
+
+   public void mapTableToNode(String tableName, String nodeAddress) {
+       if (!tableNodeMap.containsKey(tableName)) {
+           tableNodeMap.put(tableName, new ArrayList<>());
+       }
+       tableNodeMap.get(tableName).add(nodeAddress);
+   }
+
+   public List<String> getNodesWithTable(String tableName) {
+       return tableNodeMap.getOrDefault(tableName, new ArrayList<>());
+   }
+
+   public static void main(String[] args) {
+       NodeDiscovery nodeDiscovery = new NodeDiscovery();
+       List<String> activeNodes = nodeDiscovery.discoverActiveNodes();
+       System.out.println("Active nodes: " + activeNodes);
+   }
+}
+package com.vexaro.in.memory.db.services;
+import org.apache.parquet.example.data.Group;
+import org.apache.parquet.hadoop.ParquetReader;
+import org.apache.parquet.hadoop.example.GroupReadSupport;
+import org.apache.parquet.schema.MessageType;
+import org.apache.parquet.schema.PrimitiveType;
+import org.apache.parquet.schema.Type;
+import org.springframework.stereotype.Service;
+
+import java.io.IOException;
+import java.util.ArrayList;
+import java.util.List;
+import java.util.function.Consumer;
+
+@Service
+public class ParquetDataService {
+    private static final int batchSize = 100000;
+    public void parseParquetFile(String filePath,  Consumer<List<List<String>>> dataConsumer) throws IOException {
+        try (ParquetReader<Group> reader = ParquetReader.builder(new GroupReadSupport(), new org.apache.hadoop.fs.Path(filePath)).build()) {
+            Group row;
+            List<List<String>> rows = new ArrayList<>();
+            int cpt = 0;
+            while (((row = reader.read()) != null) && (cpt != 1000000)) {
+                List<String> rowData = parseRow(row);
+                rows.add(rowData);
+                cpt ++;
+
+                // Afficher la ligne lue
+                //System.out.println(rowData);
+                
+                if(rows.size() >= batchSize){
+                    dataConsumer.accept(rows);
+                    rows = new ArrayList<>();
+                }
+            }
+            if(!rows.isEmpty()) {
+                dataConsumer.accept(rows);
+            }
+        }
+
+    } 
+
+    private List<String> parseRow(Group group) {
+        List<String> rowData = new ArrayList<>();
+        MessageType schema = (MessageType) group.getType();
+        for (Type field : schema.getFields()) {
+            int fieldIndex = group.getType().getFieldIndex(field.getName());
+
+            // Check for null values
+            if (group.getFieldRepetitionCount(fieldIndex) == 0) {
+                rowData.add(null);
+                continue;
+            }
+
+            // Add support for more PrimitiveTypes as required
+            if (field.isPrimitive()) {
+                PrimitiveType.PrimitiveTypeName typeName = field.asPrimitiveType().getPrimitiveTypeName();
+                String value = "";
+                switch (typeName) {
+                    case BINARY:
+                        value = group.getBinary(field.getName(), 0).toStringUsingUTF8();
+                        break;
+                    case INT32:
+                        value = String.valueOf(group.getInteger(field.getName(), 0));
+                        break;
+                    case INT64:
+                        value = String.valueOf(group.getLong(field.getName(), 0));
+                        break;
+                    case DOUBLE:
+                        value = String.valueOf(group.getDouble(field.getName(), 0));
+                        break;
+                    case FLOAT:
+                        value = String.valueOf(group.getFloat(field.getName(), 0));
+                        break;
+                    case BOOLEAN:
+                        value = String.valueOf(group.getBoolean(field.getName(), 0));
+                        break;
+                    // Add other types as needed.
+
+                    default:
+                        throw new IllegalStateException("Unsupported type: " + typeName);
+                }
+                rowData.add(value);
+            } else {
+                // For more complex types like GroupType, further processing would be needed
+                rowData.add("Complex Type Not Supported");
+            }
+        }
+
+        return rowData;
+    }
+}
+package com.vexaro.in.memory.db.services;
+
+import java.util.List;
+
+import org.springframework.stereotype.Component;
+
+import com.vexaro.in.memory.db.services.NodeDiscovery;
+
+@Component
+public class Partitioner {
+    private NodeDiscovery nodeDiscovery;
+
+    public Partitioner(NodeDiscovery nodeDiscovery) {
+        this.nodeDiscovery = nodeDiscovery;
+    }
+
+    public String getNodeForKey(String key) {
+        List<String> nodes = nodeDiscovery.discoverActiveNodes();
+        // Implémentez votre logique de hachage ici pour mapper la clé au nœud responsable
+        int hash = key.hashCode() % nodes.size();
+        return nodes.get(hash);
+    }
+}
+package com.vexaro.in.memory.db.services;
+import com.vexaro.in.memory.db.dto.PaginatedTableData;
+import com.vexaro.in.memory.db.dto.TableRowsRequest;
+import com.vexaro.in.memory.db.models.Column;
+import com.vexaro.in.memory.db.models.TableDefinition;
+import lombok.RequiredArgsConstructor;
+import lombok.extern.slf4j.Slf4j;
+import org.springframework.http.ResponseEntity;
+import org.springframework.stereotype.Service;
+
+import java.util.*;
+
+@Slf4j
+@Service
+@RequiredArgsConstructor
+public class TableService {
+    private final ParquetDataService parquetDataService;
+    private Map<String, TableDefinition> inMemoryDatabase = new HashMap<>();
+
+    public void createSchema(TableDefinition tableDefinition) {
+        inMemoryDatabase.put(tableDefinition.getName(), tableDefinition);
+        log.info("'{}' schema created successfully", tableDefinition.getName());
+    }
+
+    public boolean loadTableData(String tableName, List<List<String>> data) {
+        TableDefinition tableDefinition = inMemoryDatabase.get(tableName);
+        if (tableDefinition != null) {
+            List<List<String>> existingRows = tableDefinition.getRows();
+            if (existingRows == null) {
+                existingRows = new ArrayList<>();
+            }
+            existingRows.addAll(data);
+            tableDefinition.setRows(existingRows);
+            return true;
+        } else {
+            return false;
+        }
+    }
+
+    public PaginatedTableData retrieveTableDataWithPagination(String tableName, int offset, int limit) {
+        TableDefinition tableDefinition = inMemoryDatabase.get(tableName);
+        if (tableDefinition == null) {
+            throw new IllegalArgumentException("The table with the given name does not exist. ");
+        }
+        List<List<String>> fullTableData = tableDefinition.getRows();
+        if (fullTableData == null) {
+            throw new IllegalArgumentException("The table with the given name does not exist.");
+        }
+
+        int totalEntries = fullTableData.size();
+        int fromIndex = Math.min(offset, totalEntries);
+        int toIndex = Math.min(offset + limit, totalEntries);
+
+        List<Map<String, String>> paginatedRows = new ArrayList<>();
+
+        for (int i = fromIndex; i < toIndex; i++) {
+            // Assuming each row is a list of strings and we map it to a corresponding
+            // column name
+            Map<String, String> rowMap = mapRowToColumnName(tableDefinition.getColumns(), fullTableData.get(i));
+            paginatedRows.add(rowMap);
+        }
+
+        PaginatedTableData paginatedTableData = new PaginatedTableData();
+        paginatedTableData.setRows(paginatedRows);
+        paginatedTableData.setTotalEntries(totalEntries);
+        paginatedTableData.setTotalPages((totalEntries + limit - 1) / limit);
+
+        return paginatedTableData;
+    }
+
+    private Map<String, String> mapRowToColumnName(List<Column> columns, List<String> rowData) {
+        Map<String, String> rowMap = new LinkedHashMap<>();
+
+        if (columns == null || columns.isEmpty()) {
+            for (int i = 0; i < rowData.size(); i++) {
+                String columnName = "column" + (i + 1); // Start naming columns with 1
+                rowMap.put(columnName, rowData.get(i));
+            }
+        } else {
+            for (int i = 0; i < columns.size(); i++) {
+                log.info("Column: {}, row: {}", columns.get(i).getName(), rowData.get(i));
+                rowMap.put(columns.get(i).getName(), rowData.get(i));
+            }
+        }
+        return rowMap;
+    }
+
+    public TableDefinition retrieveTableData(String tableName) {
+        return inMemoryDatabase.get(tableName);
+    }
+
+    
+
+    public double aggregate(String tableName, String function, String column) {
+        TableDefinition table = inMemoryDatabase.get(tableName);
+        if (table == null) {
+            throw new IllegalArgumentException("not found");
+        }
+
+        List<List<String>> rows = table.getRows();
+        double result = 0;
+        long count = 0;
+
+        switch (function.toUpperCase()) {
+            case "SUM":
+                for (List<String> row : rows) {
+                    try {
+                        double value = Double.parseDouble(row.get(table.getColumnIndex(column)));
+                        result += value;
+                    } catch (NumberFormatException ignored) {
+                    }
+                }
+                break;
+            case "COUNT":
+                for (List<String> row : rows) {
+                    String value = row.get(table.getColumnIndex(column));
+                    if (value != null && !value.isEmpty()) {
+                        count++;
+                    }
+                }
+                result = count;
+                break;
+            default:
+                throw new IllegalArgumentException("error Unsupported function");
+        }
+        return result;
+    }
+
+    public boolean insertData(String tableName, List<String> rowData) {
+        TableDefinition tableDefinition = inMemoryDatabase.get(tableName);
+        if (tableDefinition != null) {
+            List<List<String>> existingRows = tableDefinition.getRows();
+            if (existingRows == null) {
+                existingRows = new ArrayList<>();
+            }
+            existingRows.add(rowData);
+            tableDefinition.setRows(existingRows);
+            return true;
+        } else {
+            return false;
+        }
+    }
+
+    public boolean updateData(String tableName, int rowIndex, List<String> newData) {
+        TableDefinition tableDefinition = inMemoryDatabase.get(tableName);
+        if (tableDefinition != null) {
+            List<List<String>> existingRows = tableDefinition.getRows();
+            if (existingRows != null && rowIndex >= 0 && rowIndex < existingRows.size()) {
+                existingRows.set(rowIndex, newData);
+                tableDefinition.setRows(existingRows);
+                return true;
+            }
+        }
+        return false;
+    }
+
+    public boolean deleteData(String tableName, int rowIndex) {
+        TableDefinition tableDefinition = inMemoryDatabase.get(tableName);
+        if (tableDefinition != null) {
+            List<List<String>> existingRows = tableDefinition.getRows();
+            if (existingRows != null && rowIndex >= 0 && rowIndex < existingRows.size()) {
+                existingRows.remove(rowIndex);
+                tableDefinition.setRows(existingRows);
+                return true;
+            }
+        }
+        return false;
+    }
+
+}
